@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Suivi Médocs</title>
+<meta name="description" content="Suivi des médicaments post-opératoires">
+<meta name="theme-color" content="#0e7c70">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Médocs">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1 id="title">Aujourd'hui</h1>
+    <p id="subtitle" class="muted"></p>
+  </div>
+</header>
+<main id="view"></main>
+<nav class="tabs" role="tablist">
+  <button data-tab="today" class="on"><span class="ico">◉</span>Aujourd'hui</button>
+  <button data-tab="meds"><span class="ico">℞</span>Traitement</button>
+  <button data-tab="history"><span class="ico">≡</span>Historique</button>
+  <button data-tab="settings"><span class="ico">⚙</span>Réglages</button>
+</nav>
+<div id="toast" role="status" aria-live="polite"></div>
+<input type="file" id="importFile" accept="application/json" hidden>
+<script src="app.js"></script>
+</body>
+</html>
