@@ -52,13 +52,13 @@ const DEFAULT = () => ({
   log: [],
   alerts: {},
   notified: {},
-  ntfy: { on: false, topic: '', sent: {} },
+  push: { on: false, hash: '', at: 0, err: '' },
 });
 let S = null;
 const save = () => { try { if (S) localStorage.setItem(KEY, JSON.stringify(S)); } catch { /* storage unavailable */ } };
 function loadState() {
   try { S = Object.assign(DEFAULT(), JSON.parse(localStorage.getItem(KEY) || '{}')); } catch { S = DEFAULT(); }
-  if (!S.ntfy.topic) S.ntfy.topic = 'medocs-' + uid() + uid();
+  delete S.ntfy;
   save();
 }
 
@@ -185,7 +185,7 @@ function take(id, slot) {
   save();
   toast(`✓ ${m.rx} pris à ${hm(now)}`);
   render();
-  syncNtfy();
+  syncPush();
 }
 
 function skip(id, slot) {
@@ -223,36 +223,79 @@ async function notify(title, body, tag) {
   } catch { /* ignore */ }
 }
 
-async function ntfyPost(title, msg, atMs) {
-  const p = new URLSearchParams({ title, tags: 'pill', priority: '4', click: location.origin + location.pathname });
-  if (atMs) p.set('at', String(Math.floor(atMs / 1000)));
-  const r = await fetch(`https://ntfy.sh/${encodeURIComponent(S.ntfy.topic)}?${p}`, { method: 'POST', body: msg });
-  if (!r.ok) throw new Error('ntfy ' + r.status);
+/* ---------------- web push (own Cloudflare server) ---------------- */
+const PUSH = () => DATA && DATA.push;
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && canNotify();
+const b64uDec = str => { const t = str.replace(/-/g, '+').replace(/_/g, '/'); return Uint8Array.from(atob(t + '='.repeat((4 - t.length % 4) % 4)), c => c.charCodeAt(0)); };
+const b64uEnc = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+async function api(path, body) {
+  const p = PUSH();
+  const r = await fetch(p.url.replace(/\/$/, '') + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { Authorization: 'Bearer ' + p.token, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+  return j;
 }
 
-let syncing = false;
-async function syncNtfy() {
-  if (syncing || !S.ntfy.on || !S.ntfy.topic || !navigator.onLine) return;
-  syncing = true;
-  const now = Date.now(), lim = now + 70 * H;
+function pushJobs() {
+  const now = Date.now(), jobs = [];
+  for (let i = 0; i < 8; i++) {
+    for (const s of slotsOn(addDays(new Date(), i))) {
+      if (taken(s.key)) continue;
+      if (s.ts > now) jobs.push({ at: s.ts, title: `💊 ${s.m.rx} — ${s.t}`, body: `${s.m.gen} · ${s.m.meal}. ${s.m.recos[0]}`, tag: s.key });
+      const again = s.ts + 30 * 6e4;
+      if (again > now) jobs.push({ at: again, title: `⏰ Oubli ? ${s.m.rx}`, body: `Prévu à ${s.t}, pas encore coché dans Médocs.`, tag: s.key });
+    }
+  }
+  for (const [id, ts] of Object.entries(S.alerts)) {
+    if (ts <= now) continue;
+    const m = med(id);
+    jobs.push({ at: ts, title: `✓ ${m.rx} possible`, body: `Tu peux reprendre ${m.gen} si besoin · ${m.meal}.`, tag: 'alert-' + id });
+  }
+  return jobs.sort((a, b) => a.at - b.at);
+}
+
+let pushBusy = false, pushAgain = false;
+async function syncPush(force) {
+  if (!S || !S.push.on || !PUSH() || !navigator.onLine) return;
+  if (pushBusy) { pushAgain = true; return; }
+  const jobs = pushJobs(), hash = JSON.stringify(jobs);
+  if (!force && hash === S.push.hash) return;
+  pushBusy = true;
+  try { await api('/schedule', { jobs }); S.push.hash = hash; S.push.err = ''; S.push.at = Date.now(); }
+  catch (e) { S.push.err = String(e.message || e); }
+  save();
+  pushBusy = false;
+  if (pushAgain) { pushAgain = false; syncPush(); }
+}
+
+async function enablePush() {
+  if (!pushSupported()) { toast('Ouvre Médocs depuis l\'icône de l\'écran d\'accueil'); return; }
+  const perm = await Notification.requestPermission(); // must be first (user gesture)
+  if (perm !== 'granted') { toast('Refusé — Réglages iPhone › Notifications › Médocs'); render(); return; }
   try {
-    for (let i = 0; i < 4; i++) {
-      for (const s of slotsOn(addDays(new Date(), i))) {
-        if (s.ts < now + 30e3 || s.ts > lim || S.ntfy.sent[s.key] || taken(s.key)) continue;
-        await ntfyPost(`${s.m.rx} — ${s.t}`, `${s.m.gen} · ${s.m.meal}. ${s.m.recos[0]}`, s.ts);
-        S.ntfy.sent[s.key] = 1; save();
-      }
-    }
-    for (const [id, ts] of Object.entries(S.alerts)) {
-      const k = 'alert|' + id + '|' + ts;
-      if (ts > now + 30e3 && !S.ntfy.sent[k]) {
-        const m = med(id);
-        await ntfyPost(`${m.rx} possible`, `Tu peux reprendre ${m.gen} si besoin. ${m.meal}.`, ts);
-        S.ntfy.sent[k] = 1; save();
-      }
-    }
-  } catch (e) { console.warn(e); }
-  syncing = false;
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api('/vapid');
+    let sub = await reg.pushManager.getSubscription();
+    const cur = sub && sub.options && sub.options.applicationServerKey;
+    if (sub && cur && b64uEnc(cur) !== publicKey) { await sub.unsubscribe(); sub = null; }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uDec(publicKey) });
+    await api('/subscribe', { subscription: sub.toJSON() });
+    S.push.on = true; S.push.hash = ''; save();
+    await syncPush(true);
+    toast('🔔 Notifications activées');
+  } catch (e) { S.push.err = String(e.message || e); save(); toast('Erreur : ' + S.push.err); }
+  render();
+}
+
+async function disablePush() {
+  S.push.on = false; save();
+  try { await api('/schedule', { jobs: [] }); } catch { /* ignore */ }
+  toast('Notifications coupées'); render();
 }
 
 function checkLocalAlerts() {
@@ -277,11 +320,6 @@ function checkLocalAlerts() {
 function cleanup() {
   const lim = Date.now() - 5 * 864e5;
   for (const k of Object.keys(S.notified)) { const p = k.split('|'); if (p[1] && +fromKey(p[1]) < lim) delete S.notified[k]; }
-  for (const k of Object.keys(S.ntfy.sent)) {
-    const p = k.split('|');
-    const ts = p[0] === 'alert' ? +p[2] : +fromKey(p[1]);
-    if (ts < lim) delete S.ntfy.sent[k];
-  }
   save();
 }
 
@@ -482,27 +520,22 @@ function viewSettings() {
   h += `</div>
   <h2>Notifications</h2>
   <div class="card">
-    <div class="name">1. Dans l'appli</div>
-    <div class="gen">Alerte quand l'appli est ouverte ou en arrière-plan récent. Statut : <b>${perm}</b></div>
-    ${perm === 'indisponible' ? `<div class="warnbox small">Ajoute d'abord l'appli à l'écran d'accueil puis ouvre-la depuis l'icône.</div>`
-      : `<div class="btns"><button class="btn ghost" data-a="perm">Autoriser</button><button class="btn ghost" data-a="testlocal">Tester</button></div>`}
+    <div class="name">Notifications push</div>
+    <div class="gen">Chaque prise à l'heure, relance 30 min après si pas cochée, et « possible maintenant » pour les minuteurs. Même appli fermée.</div>
+    ${!PUSH() ? `<div class="warnbox small">Serveur de notifications non configuré.</div>`
+      : !isStandalone() ? `<div class="warnbox small">Installe d'abord Médocs sur l'écran d'accueil, puis ouvre-la depuis l'icône.</div>`
+      : `${S.push.on
+          ? (S.push.err ? `<div class="status no">Erreur : ${esc(S.push.err)}</div>` : `<div class="status ok">✓ Activées${S.push.at ? ' · synchro ' + relDay(S.push.at) + hm(S.push.at) : ''}</div>`)
+          : `<div class="status wait">Désactivées</div>`}
+        <div class="btns">
+          <button class="btn ${S.push.on ? 'ghost' : ''}" data-a="pushOn">${S.push.on ? 'Réactiver' : 'Activer'}</button>
+          ${S.push.on ? `<button class="btn ghost" data-a="pushTest">Tester</button><button class="btn danger" data-a="pushOff">Couper</button>` : ''}
+        </div>`}
   </div>
   <div class="card">
-    <div class="name">2. Calendrier iPhone (fiable, hors ligne)</div>
+    <div class="name">Calendrier iPhone (secours, hors ligne)</div>
     <div class="gen">Ajoute toutes les prises programmées avec alarme dans Calendrier. À refaire si tu changes les heures.</div>
-    <div class="btns"><button class="btn" data-a="ics">Ajouter au Calendrier</button></div>
-  </div>
-  <div class="card">
-    <div class="name">3. Push ntfy (même appli fermée, minuteurs inclus)</div>
-    <div class="gen">Notifications push via l'appli gratuite <b>ntfy</b>. Envoie le nom du médoc et l'heure au serveur ntfy.sh, sur un canal privé aléatoire.</div>
-    <ol>
-      <li>Installe <b>ntfy</b> depuis l'App Store</li>
-      <li>Dans ntfy : « + » → nom du canal : <code>${esc(S.ntfy.topic)}</code> <button class="x" data-a="copy" aria-label="Copier">⧉</button></li>
-      <li>Active ci-dessous puis « Tester »</li>
-    </ol>
-    <div class="field" style="margin-top:6px"><span>Activer ntfy</span><label class="switch"><input type="checkbox" data-set="ntfy" ${S.ntfy.on ? 'checked' : ''}><span></span></label></div>
-    <div class="btns"><button class="btn ghost" data-a="testntfy">Tester</button><button class="btn ghost" data-a="resync">Re-programmer</button></div>
-    <div class="small muted" style="margin-top:8px">Programme les 3 prochains jours à chaque ouverture de l'appli. Ouvre-la au moins 1 fois / 3 jours.</div>
+    <div class="btns"><button class="btn ghost" data-a="ics">Ajouter au Calendrier</button></div>
   </div>
   <h2>Données</h2><div class="card"><div class="btns">
     <button class="btn ghost" data-a="export">Exporter</button>
@@ -528,6 +561,7 @@ function render() {
   $('#view').innerHTML = { today: viewToday, meds: viewMeds, history: viewHistory, settings: viewSettings }[tab]();
   scrollTo(0, y);
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  syncPush();
 }
 
 // live countdowns, every second, no full re-render
@@ -578,21 +612,19 @@ document.addEventListener('click', async e => {
         toast(`🔔 Rappel à ${hm(st.next)}`);
         if (canNotify() && Notification.permission === 'default') await Notification.requestPermission();
       }
-      save(); render(); syncNtfy(); break;
+      save(); render(); syncPush(); break;
     }
     case 'perm':
       if (canNotify()) { const p = await Notification.requestPermission(); toast('Notifications : ' + p); render(); }
       break;
     case 'testlocal': notify('💊 Test', 'Les notifications marchent.', 'test'); toast('Notification envoyée'); break;
     case 'ics': download('suivi-medocs.ics', buildICS(), 'text/calendar'); break;
-    case 'copy':
-      try { await navigator.clipboard.writeText(S.ntfy.topic); toast('Copié'); } catch { toast(S.ntfy.topic); }
+    case 'pushOn': enablePush(); break;
+    case 'pushOff': disablePush(); break;
+    case 'pushTest':
+      try { const r = await api('/test', {}); toast(r.ok ? 'Envoyé — regarde tes notifications' : 'Échec : ' + (r.error || r.status)); }
+      catch (e) { toast('Erreur : ' + e.message); }
       break;
-    case 'testntfy':
-      try { await ntfyPost('Test Médocs', 'Les notifications ntfy marchent 💊'); toast('Envoyé — vérifie ntfy'); }
-      catch { toast('Échec envoi (réseau ?)'); }
-      break;
-    case 'resync': S.ntfy.sent = {}; save(); await syncNtfy(); toast('Re-programmé'); break;
     case 'export': download(`medocs-${dkey(new Date())}.json`, JSON.stringify(S, null, 2), 'application/json'); break;
     case 'import': $('#importFile').click(); break;
     case 'lock': lock(); break;
@@ -609,11 +641,10 @@ document.addEventListener('change', e => {
   const el = e.target, k = el.dataset.set;
   if (!k) return;
   if (k === 'perfusion') S.perfusion = el.checked;
-  else if (k === 'start' && el.value) { S.start = el.value; S.ntfy.sent = {}; }
-  else if (k === 'time' && el.value) { S.times[el.dataset.id][+el.dataset.i] = el.value; S.times[el.dataset.id].sort(); S.ntfy.sent = {}; }
+  else if (k === 'start' && el.value) { S.start = el.value; }
+  else if (k === 'time' && el.value) { S.times[el.dataset.id][+el.dataset.i] = el.value; S.times[el.dataset.id].sort(); }
   else if (k === 'stock') S.stock[el.dataset.id] = el.value === '' ? null : +el.value;
-  else if (k === 'ntfy') S.ntfy.on = el.checked;
-  save(); render(); syncNtfy();
+  save(); render(); syncPush();
 });
 
 $('#importFile').addEventListener('change', async e => {
@@ -626,7 +657,7 @@ $('#importFile').addEventListener('change', async e => {
   e.target.value = '';
 });
 
-document.addEventListener('visibilitychange', () => { if (!document.hidden && S) { render(); checkLocalAlerts(); syncNtfy(); checkRev(); } });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S) { render(); checkLocalAlerts(); syncPush(); checkRev(); } });
 
 /* ---------------- boot ---------------- */
 let timer = null;
@@ -636,7 +667,7 @@ function start() {
   cleanup();
   render();
   checkLocalAlerts();
-  syncNtfy();
+  syncPush();
   if (!timer) timer = setInterval(() => { if (S) tickSecond(); }, 1000);
 }
 
