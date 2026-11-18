@@ -143,6 +143,12 @@ function slotsOn(d) {
   return out.sort((a, b) => a.ts - b.ts);
 }
 const taken = key => S.log.find(l => l.slot === key);
+// Unchecked slots from the previous days (to catch up forgotten check-ins)
+function missedSlots(days = 3) {
+  const out = [];
+  for (let i = days; i >= 1; i--) out.push(...slotsOn(addDays(new Date(), -i)).filter(s => !taken(s.key)));
+  return out;
+}
 
 function nextPending(now = Date.now()) {
   for (let i = 0; i < 4; i++) {
@@ -186,6 +192,16 @@ function take(id, slot) {
   toast(`✓ ${m.rx} pris à ${hm(now)}`);
   render();
   syncPush();
+}
+
+function takeAt(id, slot) {
+  const s = slot.split('|'), m = med(id);
+  const when = +fromKey(s[1], s[2]);
+  if (taken(slot)) return;
+  S.log.push({ id: uid(), med: id, t: when, slot });
+  save();
+  toast(`✓ ${m.rx} noté pris ${relDay(when)}à ${s[2]}`);
+  render();
 }
 
 function skip(id, slot) {
@@ -392,6 +408,25 @@ function viewToday() {
       <div class="sub">${esc(nx.m.rx)} · ${esc(nx.m.meal)}</div></div>`;
   } else {
     h += `<div class="card hero done"><div class="lbl">Aujourd'hui</div><div class="big">Tout est pris ✓</div></div>`;
+  }
+
+  // Forgotten check-ins from previous days
+  const missed = missedSlots();
+  if (missed.length) {
+    h += `<h2>Non cochées les jours d'avant</h2>`;
+    if (missed.length > 1) h += `<div class="card"><div class="row"><div class="grow"><div class="name">${missed.length} prises non cochées</div>
+      <div class="gen">Tu les as prises mais pas notées ?</div></div>
+      <button class="btn" data-a="takeAllMissed">Tout noter pris</button></div></div>`;
+    for (const s of missed) {
+      h += `<div class="card slot"><div class="row">
+        <div class="time">${s.t}</div><span class="dot" style="background:${s.m.color}"></span>
+        <div class="grow"><div class="name">${esc(s.m.rx)}</div>
+          <div class="gen">${longDate(new Date(s.ts))}</div></div></div>
+        <div class="btns">
+          <button class="btn ghost" data-a="takeAt" data-id="${s.m.id}" data-slot="${s.key}">Pris à ${s.t}</button>
+          <button class="btn ghost" data-a="skip" data-id="${s.m.id}" data-slot="${s.key}">Pas pris</button>
+        </div></div>`;
+    }
   }
 
   // Timers (gap-based)
@@ -603,6 +638,14 @@ document.addEventListener('click', async e => {
     case 'take': take(id, b.dataset.slot); break;
     case 'untake': untake(id); break;
     case 'skip': skip(id, b.dataset.slot); break;
+    case 'takeAt': takeAt(id, b.dataset.slot); break;
+    case 'takeAllMissed': {
+      const ms = missedSlots();
+      if (!confirm(`Noter ces ${ms.length} prises comme prises à l'heure prévue ?\n\n` + ms.map(x => `${shortDate(new Date(x.ts))} ${x.t} — ${x.m.rx}`).join('\n'))) break;
+      for (const x of ms) S.log.push({ id: uid(), med: x.m.id, t: x.ts, slot: x.key });
+      save(); toast(`✓ ${ms.length} prises notées`); render();
+      break;
+    }
     case 'edit': editTime(id); break;
     case 'alert': {
       const st = medStatus(med(id));
